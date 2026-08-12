@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Olc Server</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+
+  <main id="login-view" class="login-shell">
+    <section class="login-card">
+      <div class="brand-mark" aria-hidden="true"><span>O</span></div>
+      <p class="eyebrow">SERVER CONTROL</p>
+      <h1>Olc Server</h1>
+      <p class="lead">Панель управления комнатами Olc Server.</p>
+      <form id="login-form">
+        <label for="login-password">Пароль администратора</label>
+        <div class="input-row">
+          <input id="login-password" type="password" autocomplete="current-password" required autofocus>
+          <button class="primary compact" type="submit">Войти</button>
+        </div>
+        <p id="login-error" class="form-error" role="alert"></p>
+      </form>
+      <p class="security-note"><span></span> Защищено паролем администратора</p>
+    </section>
+  </main>
+
+  <div id="app-view" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="brand-row">
+        <div class="brand-mark small"><span>O</span></div>
+        <div><strong>Olc Server</strong><small id="version-label">Control plane</small></div>
+      </div>
+      <nav>
+        <button class="nav-item active" data-page="rooms"><span class="nav-icon">◫</span>Комнаты</button>
+        <button class="nav-item" data-page="settings"><span class="nav-icon">◇</span>Настройки</button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="system-state"><span class="pulse"></span><div><strong>Система работает</strong><small>Control plane online</small></div></div>
+        <button id="logout-button" class="text-button">Выйти</button>
+      </div>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">SERVER CONTROL</p>
+          <h2 id="page-title">Комнаты</h2>
+        </div>
+        <button id="primary-action" class="primary">+ Новая комната</button>
+      </header>
+
+      <div id="message" class="message hidden" role="status"></div>
+
+      <section id="rooms-page" class="page">
+        <div class="metrics">
+          <article><span>КОМНАТЫ</span><strong id="rooms-count">0</strong><small>конфигураций</small></article>
+          <article><span>ЗАПУЩЕНО</span><strong id="running-count">0</strong><small>активных процессов</small></article>
+        </div>
+        <div class="section-heading"><div><h3>Ваши комнаты</h3><p>Каждая комната работает отдельным процессом olcrtc.</p></div></div>
+        <div id="rooms-list" class="card-grid"></div>
+      </section>
+
+      <section id="settings-page" class="page hidden">
+        <div class="settings-block">
+          <div class="section-heading"><div><h3>Сетевой доступ</h3><p>Управляйте доступностью панели за пределами сервера.</p></div></div>
+          <label class="toggle-row"><span><strong>Удаленный доступ</strong><small>Разрешить открывать панель по IP-адресу сервера</small></span><input id="public-access" type="checkbox"></label>
+          <label class="settings-field">Провайдер по умолчанию<select id="default-carrier"><option value="jitsi">Jitsi</option><option value="telemost">Telemost</option><option value="wbstream">WB Stream</option></select><small class="muted">Используется как начальное значение при создании комнаты.</small></label>
+        </div>
+        <div class="section-heading backup-heading"><div><h3>Резервные копии</h3><p>Экспортируйте или восстановите конфигурацию комнат.</p></div></div>
+        <div class="backup-layout">
+          <article class="backup-card featured">
+            <span class="backup-icon">↓</span>
+            <h3>Создать backup</h3>
+            <p>Комнаты, описания и ключи будут сохранены в одном файле.</p>
+            <button id="export-button" class="primary">Скачать .olcbak</button>
+          </article>
+          <article class="backup-card">
+            <span class="backup-icon">↑</span>
+            <h3>Восстановить</h3>
+            <p>Текущее состояние будет заменено содержимым выбранного backup.</p>
+            <label class="file-picker"><input id="import-file" type="file" accept=".olcbak">Выбрать .olcbak</label>
+            <button id="import-button" class="secondary danger-outline">Восстановить состояние</button>
+          </article>
+        </div>
+      </section>
+    </section>
+  </div>
+
+  <dialog id="room-dialog">
+    <form id="room-form" class="modal-form">
+      <div class="modal-heading"><div><p class="eyebrow">ROOM CONFIGURATION</p><h3 id="room-dialog-title">Новая комната</h3></div><button class="icon-button" type="button" data-close="room-dialog">×</button></div>
+      <input id="room-id" type="hidden">
+      <div class="form-grid">
+        <label class="wide">Название<input id="room-name" required placeholder="Основная комната"></label>
+        <label class="wide">Описание<textarea id="room-description" maxlength="500" placeholder="Для чего используется эта комната"></textarea></label>
+          <label>Провайдер<select id="room-carrier"><option value="jitsi">Jitsi</option><option value="telemost">Telemost</option><option value="wbstream">WB Stream</option></select></label>
+        <label>Транспорт<select id="room-transport"><option value="datachannel">Data channel</option><option value="vp8channel">VP8 channel</option></select></label>
+        <label class="wide">Идентификатор комнаты<input id="room-external-id" required placeholder="URL или ID комнаты"></label>
+        <label>DNS<input id="room-dns" value="8.8.8.8:53"></label>
+        <label>Состояние<select id="room-enabled"><option value="true">Запущена</option><option value="false">Остановлена</option></select></label>
+        <label class="vp8-field">VP8 FPS<input id="room-vp8-fps" type="number" min="1" max="120" value="60"></label>
+        <label class="vp8-field">VP8 batch<input id="room-vp8-batch" type="number" min="1" max="64" value="64"></label>
+        <label class="wide">Ключ шифрования <span class="muted">оставьте пустым для генерации</span><input id="room-key" minlength="64" maxlength="64" placeholder="64 hex символа"></label>
+      </div>
+      <p id="room-error" class="form-error"></p>
+      <div class="modal-actions"><button type="button" class="secondary" data-close="room-dialog">Отмена</button><button class="primary" type="submit">Сохранить комнату</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="qr-dialog">
+    <div class="modal-form qr-modal">
+      <div class="modal-heading"><div><p class="eyebrow">ROOM LINK</p><h3 id="qr-title">QR-код комнаты</h3></div><button class="icon-button" type="button" data-close="qr-dialog">×</button></div>
+      <img id="qr-image" alt="QR-код ссылки комнаты">
+      <p>Отсканируйте код в клиенте Olc.</p>
+    </div>
+  </dialog>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>
