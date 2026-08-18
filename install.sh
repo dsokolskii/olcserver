@@ -384,21 +384,27 @@ prepare_work_dir() {
       ""|tmpfs|ramfs) continue ;;
     esac
     disk_available_kib="$(df -Pk "${candidate}" 2>/dev/null | awk 'NR == 2 { print $4 }' || true)"
-    if [[ ! "${disk_available_kib}" =~ ^[0-9]+$ || "${disk_available_kib}" -lt 1048576 ]]; then
+    if [[ ! "${disk_available_kib}" =~ ^[0-9]+$ || "${disk_available_kib}" -lt 2097152 ]]; then
       continue
     fi
     if WORK_DIR="$(mktemp -d "${candidate}/olcserver-install.XXXXXX")"; then
-      if ! install -d -m 0700 "${WORK_DIR}/go-tmp"; then
+      if ! install -d -m 0700 \
+        "${WORK_DIR}/go-tmp" \
+        "${WORK_DIR}/go-build-cache" \
+        "${WORK_DIR}/go-mod-cache"; then
         rm -rf -- "${WORK_DIR}"
         WORK_DIR=""
         continue
       fi
       export GOTMPDIR="${WORK_DIR}/go-tmp"
+      export GOCACHE="${WORK_DIR}/go-build-cache"
+      export GOMODCACHE="${WORK_DIR}/go-mod-cache"
+      export GOTOOLCHAIN=local
       return 0
     fi
   done
 
-  echo "ERROR: no disk-backed temporary directory with at least 1024 MB free was found"
+  echo "ERROR: no disk-backed temporary directory with at least 2048 MB free was found"
   return 1
 }
 
@@ -410,7 +416,8 @@ ensure_build_swap() {
   local margin_kib=$((BUILD_MEMORY_MARGIN_MB * 1024))
   local missing_headroom_kib missing_swap_kib missing_kib swap_size_mb
   local cgroup_new_swap_kib cgroup_new_swap_mb
-  local disk_available_kib filesystem_type orphaned_swap temporary_swap_path
+  local disk_available_kib disk_required_kib disk_shortfall_kib
+  local filesystem_type orphaned_swap temporary_swap_path
   local container_detected="false" chroot_detected="false"
 
   orphaned_swap="$(find / -maxdepth 1 -type f \
@@ -504,12 +511,21 @@ ensure_build_swap() {
 
   disk_available_kib="$(df -Pk / 2>/dev/null | awk 'NR == 2 { print $4 }' || true)"
   if [[ ! "${disk_available_kib}" =~ ^[0-9]+$ ]]; then
-    low_memory_failure "free disk space could not be determined"
-    return
+    echo "ERROR: free disk space on / could not be determined"
+    return 1
   fi
-  if (( disk_available_kib < swap_size_mb * 1024 + 2 * 1024 * 1024 )); then
-    low_memory_failure "not enough disk space to create ${swap_size_mb} MB of swap and retain 2048 MB for the build"
-    return
+  disk_required_kib=$((swap_size_mb * 1024 + 2 * 1024 * 1024))
+  if (( disk_available_kib < disk_required_kib )); then
+    disk_shortfall_kib=$((disk_required_kib - disk_available_kib))
+    echo "ERROR: insufficient disk space for swap and compilation"
+    echo "Disk space on /: $((disk_available_kib / 1024)) MB available, $((disk_required_kib / 1024)) MB required, $(((disk_shortfall_kib + 1023) / 1024)) MB short"
+    echo "Current Go caches from earlier attempts, if present:"
+    du -sh /root/.cache/go-build /root/go/pkg/mod 2>/dev/null || true
+    if [[ -x /usr/local/go/bin/go ]]; then
+      echo "They can be recreated and removed with: /usr/local/go/bin/go clean -cache -modcache"
+    fi
+    echo "Package-manager caches may also be cleaned before retrying"
+    return 1
   fi
 
   echo "Creating ${swap_size_mb} MB of swap at ${SWAP_FILE}"
