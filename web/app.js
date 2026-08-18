@@ -75,7 +75,16 @@ function roomCard(room) {
   });
   const status = element("span", `status ${room.status}`, statusText(room.status));
   head.append(title, status, more);
-  if (room.error) card.title = room.error;
+
+  let runtimeError;
+  if (room.status === "failed") {
+    runtimeError = element("div", "room-runtime-error");
+    runtimeError.setAttribute("role", "alert");
+    runtimeError.append(
+      element("strong", "", "Почему комната остановилась"),
+      element("pre", "", room.error || "Процесс olcrtc завершился без сообщения об ошибке.")
+    );
+  }
 
   const meta = element("div", "room-meta");
   meta.append(metaItem("Транспорт", room.transport), metaItem("DNS", room.dns));
@@ -94,7 +103,9 @@ function roomCard(room) {
   qr.addEventListener("click", () => openQR(room));
   link.append(linkInput, copy, qr);
 
-  card.append(head, meta, link);
+  card.append(head);
+  if (runtimeError) card.append(runtimeError);
+  card.append(meta, link);
   return card;
 }
 
@@ -132,7 +143,7 @@ function openRoom(room = null) {
   $("#room-carrier").value = room?.carrier || state.defaultCarrier;
   $("#room-transport").value = room?.transport || "datachannel";
   $("#room-external-id").value = room?.roomId || "";
-  $("#room-dns").value = room?.dns || "8.8.8.8:53";
+  $("#room-dns").value = room?.dns || "1.1.1.1:53";
   $("#room-enabled").value = String(room?.enabled ?? true);
   $("#room-vp8-fps").value = room?.vp8Fps || 60;
   $("#room-vp8-batch").value = room?.vp8Batch || 64;

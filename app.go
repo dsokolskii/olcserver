@@ -27,6 +27,7 @@ const (
 	defaultHTTPTimeout  = 15 * time.Second
 	defaultWriteTimeout = 60 * time.Second
 	defaultIdleTimeout  = 90 * time.Second
+	defaultDNSAddress   = "1.1.1.1:53"
 	maxJSONBody         = 1 << 20
 	maxBackupBody       = 16 << 20
 )
@@ -386,7 +387,7 @@ func normalizeRoom(input Room, create bool) (Room, error) {
 		return Room{}, errors.New("use vp8channel for Telemost and WB Stream")
 	}
 	if input.DNS == "" {
-		input.DNS = "8.8.8.8:53"
+		input.DNS = defaultDNSAddress
 	}
 	if input.VP8FPS == 0 {
 		input.VP8FPS = 60

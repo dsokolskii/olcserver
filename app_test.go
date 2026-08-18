@@ -26,8 +26,39 @@ func TestNormalizeRoomGeneratesKeyAndDefaults(t *testing.T) {
 	if len(room.ID) != 24 || len(room.KeyHex) != 64 {
 		t.Fatalf("unexpected generated identifiers: id=%q key=%q", room.ID, room.KeyHex)
 	}
-	if room.Name != "Main" || room.DNS != "8.8.8.8:53" || room.VP8FPS != 60 || room.VP8Batch != 64 {
+	if room.Name != "Main" || room.DNS != "1.1.1.1:53" || room.VP8FPS != 60 || room.VP8Batch != 64 {
 		t.Fatalf("unexpected normalized room: %+v", room)
+	}
+}
+
+func TestRuntimeLogExcerptReturnsUsefulTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "olcrtc.log")
+	lines := []string{
+		"old line 1", "old line 2", "old line 3", "old line 4", "old line 5",
+		"old line 6", "\x1b[31mfatal: DNS request timed out\x1b[0m", "detail 1", "detail 2",
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	excerpt := runtimeLogExcerpt(path, 0)
+	if strings.Contains(excerpt, "old line 1") || strings.Contains(excerpt, "\x1b[") {
+		t.Fatalf("excerpt was not trimmed or sanitized: %q", excerpt)
+	}
+	if !strings.Contains(excerpt, "fatal: DNS request timed out") || !strings.Contains(excerpt, "detail 2") {
+		t.Fatalf("excerpt is missing the latest error: %q", excerpt)
+	}
+}
+
+func TestRuntimeLogExcerptIgnoresPreviousRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "olcrtc.log")
+	previous := "previous run failed\n"
+	current := "current run failed\n"
+	if err := os.WriteFile(path, []byte(previous+current), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	excerpt := runtimeLogExcerpt(path, int64(len(previous)))
+	if excerpt != strings.TrimSpace(current) {
+		t.Fatalf("unexpected excerpt: %q", excerpt)
 	}
 }
 

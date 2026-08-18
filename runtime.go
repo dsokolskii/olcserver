@@ -2,14 +2,23 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+const (
+	runtimeErrorLogBytes = 8 << 10
+	runtimeErrorLogLines = 8
+)
+
+var ansiEscapeSequence = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
 type processState struct {
 	command *exec.Cmd
@@ -102,9 +111,14 @@ func (r *roomRuntime) startLocked(room Room) error {
 	if err := os.WriteFile(configPath, []byte(roomYAML(room, filepath.Join(dir, "data"))), 0o600); err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile(filepath.Join(dir, "olcrtc.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	logPath := filepath.Join(dir, "olcrtc.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
+	}
+	logStart := int64(0)
+	if info, statErr := logFile.Stat(); statErr == nil {
+		logStart = info.Size()
 	}
 	cmd := exec.Command(r.executable, configPath)
 	cmd.Stdout = logFile
@@ -128,13 +142,62 @@ func (r *roomRuntime) startLocked(room Room) error {
 			return
 		}
 		process.status = "failed"
-		if err != nil {
-			process.err = err.Error()
-		} else {
-			process.err = "process exited"
-		}
+		process.err = processError(err, logPath, logStart)
 	}(room.ID, state)
 	return nil
+}
+
+func processError(waitErr error, logPath string, logStart int64) string {
+	message := "process exited"
+	if waitErr != nil {
+		message = waitErr.Error()
+	}
+	if excerpt := runtimeLogExcerpt(logPath, logStart); excerpt != "" {
+		return message + "\n" + excerpt
+	}
+	return message
+}
+
+func runtimeLogExcerpt(logPath string, logStart int64) string {
+	file, err := os.Open(logPath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return ""
+	}
+	offset := logStart
+	if minimum := info.Size() - runtimeErrorLogBytes; offset < minimum {
+		offset = minimum
+	}
+	if offset < 0 || offset > info.Size() {
+		offset = 0
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return ""
+	}
+	data, err := io.ReadAll(io.LimitReader(file, runtimeErrorLogBytes))
+	if err != nil {
+		return ""
+	}
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	if offset > logStart {
+		if newline := strings.IndexByte(text, '\n'); newline >= 0 {
+			text = text[newline+1:]
+		}
+	}
+	text = strings.TrimSpace(ansiEscapeSequence.ReplaceAllString(text, ""))
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > runtimeErrorLogLines {
+		lines = lines[len(lines)-runtimeErrorLogLines:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (r *roomRuntime) stopLocked(id string) {
