@@ -104,11 +104,11 @@ func (r *roomRuntime) stopAll() {
 
 func (r *roomRuntime) startLocked(room Room) error {
 	dir := filepath.Join(r.dataDir, "rooms", room.ID)
-	if err := os.MkdirAll(filepath.Join(dir, "data"), 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	configPath := filepath.Join(dir, "server.yaml")
-	if err := os.WriteFile(configPath, []byte(roomYAML(room, filepath.Join(dir, "data"))), 0o600); err != nil {
+	if err := os.WriteFile(configPath, []byte(roomYAML(room)), 0o600); err != nil {
 		return err
 	}
 	logPath := filepath.Join(dir, "olcrtc.log")
@@ -217,7 +217,7 @@ func (r *roomRuntime) stopLocked(id string) {
 	}
 }
 
-func roomYAML(room Room, dataDir string) string {
+func roomYAML(room Room) string {
 	var builder strings.Builder
 	builder.WriteString("mode: srv\n")
 	builder.WriteString("auth:\n  provider: " + yamlString(room.Carrier) + "\n")
@@ -227,7 +227,6 @@ func roomYAML(room Room, dataDir string) string {
 	if room.Transport == "vp8channel" {
 		builder.WriteString("vp8:\n  fps: " + strconv.Itoa(room.VP8FPS) + "\n  batch_size: " + strconv.Itoa(room.VP8Batch) + "\n")
 	}
-	builder.WriteString("data: " + yamlString(dataDir) + "\n")
 	return builder.String()
 }
 

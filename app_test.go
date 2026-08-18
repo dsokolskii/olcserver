@@ -165,11 +165,14 @@ func TestRoomYAML(t *testing.T) {
 		Carrier: "wbstream", RoomID: "room", KeyHex: strings.Repeat("b", 64),
 		Transport: "vp8channel", DNS: "1.1.1.1:53", VP8FPS: 30, VP8Batch: 4,
 	}
-	config := roomYAML(room, "/var/lib/olc/data")
+	config := roomYAML(room)
 	for _, expected := range []string{`provider: "wbstream"`, `transport: "vp8channel"`, "fps: 30", "batch_size: 4"} {
 		if !strings.Contains(config, expected) {
 			t.Fatalf("config does not contain %q:\n%s", expected, config)
 		}
+	}
+	if strings.Contains(config, "\ndata:") {
+		t.Fatalf("config contains an unconfigured name override:\n%s", config)
 	}
 }
 
