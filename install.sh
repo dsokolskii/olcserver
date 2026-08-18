@@ -14,14 +14,37 @@ DOMAIN="${OLCSERVER_DOMAIN:-}"
 LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
 AUTO_SWAP="${OLCSERVER_AUTO_SWAP:-true}"
 MIN_BUILD_MEMORY_MB="${OLCSERVER_MIN_BUILD_MEMORY_MB:-4096}"
+MIN_BUILD_SWAP_MB="${OLCSERVER_MIN_BUILD_SWAP_MB:-4096}"
 BUILD_JOBS="${OLCSERVER_BUILD_JOBS:-1}"
-SWAP_FILE="/swapfile"
+BUILD_GOGC="${OLCSERVER_BUILD_GOGC:-20}"
+ALLOW_LOW_MEMORY="${OLCSERVER_ALLOW_LOW_MEMORY_BUILD:-false}"
+BUILD_MEMORY_MARGIN_MB=512
+SWAP_ACCOUNTING_TOLERANCE_KIB=64
+RAM_CAPACITY_TOLERANCE_MB=0
+PRIMARY_SWAP_FILE="/swapfile"
+SUPPLEMENTAL_SWAP_FILE="/olcserver.swap"
+SWAP_FILE="${PRIMARY_SWAP_FILE}"
 INSTALL_LOCK_FILE="/run/olcserver-install.lock"
 LISTEN_ADDRESS="0.0.0.0"
 HTTPS_ENABLED="false"
+MANAGED_PROXY_ACTIVE="false"
+EXISTING_CERT_NAME=""
 MANAGED_SWAP_PATH=""
 SWAP_SETUP_PENDING="false"
 WORK_DIR=""
+MEMORY_TOTAL_KIB=0
+MEMORY_AVAILABLE_KIB=0
+SWAP_TOTAL_KIB=0
+SWAP_FREE_KIB=0
+EFFECTIVE_MEMORY_TOTAL_KIB=0
+EFFECTIVE_MEMORY_AVAILABLE_KIB=0
+EFFECTIVE_SWAP_TOTAL_KIB=0
+EFFECTIVE_SWAP_FREE_KIB=0
+EFFECTIVE_HEADROOM_KIB=0
+CGROUP_SWAP_LIMIT_KIB=-1
+CGROUP_SWAP_REMAINING_KIB=-1
+CGROUP_V2_PATH=""
+CGROUP_LIMITS_FOUND="false"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this installer as root: sudo bash install.sh"
@@ -43,13 +66,31 @@ case "${AUTO_SWAP}" in
   true|false) ;;
   *) echo "OLCSERVER_AUTO_SWAP must be true or false"; exit 1 ;;
 esac
+case "${ALLOW_LOW_MEMORY}" in
+  true|false) ;;
+  *) echo "OLCSERVER_ALLOW_LOW_MEMORY_BUILD must be true or false"; exit 1 ;;
+esac
 if [[ ! "${MIN_BUILD_MEMORY_MB}" =~ ^[1-9][0-9]*$ ]] || (( MIN_BUILD_MEMORY_MB > 65536 )); then
   echo "OLCSERVER_MIN_BUILD_MEMORY_MB must be an integer between 1 and 65536"
+  exit 1
+fi
+if [[ ! "${MIN_BUILD_SWAP_MB}" =~ ^[1-9][0-9]*$ ]] || (( MIN_BUILD_SWAP_MB > 65536 )); then
+  echo "OLCSERVER_MIN_BUILD_SWAP_MB must be an integer between 1 and 65536"
   exit 1
 fi
 if [[ ! "${BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]] || (( BUILD_JOBS > 256 )); then
   echo "OLCSERVER_BUILD_JOBS must be an integer between 1 and 256"
   exit 1
+fi
+if [[ ! "${BUILD_GOGC}" =~ ^[1-9][0-9]*$ ]] || (( BUILD_GOGC > 100 )); then
+  echo "OLCSERVER_BUILD_GOGC must be an integer between 1 and 100"
+  exit 1
+fi
+if (( MIN_BUILD_MEMORY_MB == 4096 )); then
+  RAM_CAPACITY_TOLERANCE_MB=256
+fi
+if (( MIN_BUILD_SWAP_MB == 4096 )); then
+  SWAP_ACCOUNTING_TOLERANCE_KIB=16384
 fi
 
 if command -v apt-get >/dev/null 2>&1; then
@@ -187,54 +228,244 @@ register_swap_in_fstab() {
   return 0
 }
 
-ensure_build_swap() {
-  local memory_kib swap_kib minimum_kib missing_kib swap_size_mb disk_available_kib filesystem_type orphaned_swap
+read_build_memory_state() {
+  local memory_values cgroup_relative cgroup_dir limit_bytes current_bytes
+  local limit_kib current_kib remaining_kib
+  local unlimited_threshold=1152921504606846976
 
-  orphaned_swap="$(find / -maxdepth 1 -type f -name 'swapfile.olcserver.*' -print -quit 2>/dev/null || true)"
+  if [[ ! -r /proc/meminfo || ! -r /proc/swaps ]]; then
+    return 1
+  fi
+  memory_values="$(awk '
+    /^MemTotal:/ { memory_total = $2 }
+    /^MemAvailable:/ { memory_available = $2; memory_available_seen = 1 }
+    /^MemFree:/ { memory_free = $2 }
+    /^Buffers:/ { buffers = $2 }
+    /^Cached:/ { cached = $2 }
+    /^SwapTotal:/ { swap_total = $2 }
+    /^SwapFree:/ { swap_free = $2 }
+    END {
+      if (!memory_available_seen) memory_available = memory_free + buffers + cached
+      print memory_total + 0, memory_available + 0, swap_total + 0, swap_free + 0
+    }
+  ' /proc/meminfo 2>/dev/null || true)"
+  if ! read -r MEMORY_TOTAL_KIB MEMORY_AVAILABLE_KIB SWAP_TOTAL_KIB SWAP_FREE_KIB <<<"${memory_values}"; then
+    return 1
+  fi
+  if [[ ! "${MEMORY_TOTAL_KIB}" =~ ^[0-9]+$ || ! "${MEMORY_AVAILABLE_KIB}" =~ ^[0-9]+$ \
+    || ! "${SWAP_TOTAL_KIB}" =~ ^[0-9]+$ || ! "${SWAP_FREE_KIB}" =~ ^[0-9]+$ \
+    || "${MEMORY_TOTAL_KIB}" == "0" ]]; then
+    return 1
+  fi
+
+  EFFECTIVE_MEMORY_TOTAL_KIB="${MEMORY_TOTAL_KIB}"
+  EFFECTIVE_MEMORY_AVAILABLE_KIB="${MEMORY_AVAILABLE_KIB}"
+  EFFECTIVE_SWAP_TOTAL_KIB="${SWAP_TOTAL_KIB}"
+  EFFECTIVE_SWAP_FREE_KIB="${SWAP_FREE_KIB}"
+  CGROUP_SWAP_LIMIT_KIB=-1
+  CGROUP_SWAP_REMAINING_KIB=-1
+  CGROUP_V2_PATH=""
+  CGROUP_LIMITS_FOUND="false"
+
+  cgroup_relative="$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' /proc/self/cgroup 2>/dev/null || true)"
+  if [[ "${cgroup_relative}" == /* ]]; then
+    cgroup_dir="/sys/fs/cgroup${cgroup_relative}"
+    cgroup_dir="${cgroup_dir%/}"
+    [[ -n "${cgroup_dir}" ]] || cgroup_dir="/sys/fs/cgroup"
+    if [[ ( "${cgroup_dir}" == "/sys/fs/cgroup" || "${cgroup_dir}" == /sys/fs/cgroup/* ) \
+      && -r "${cgroup_dir}/memory.max" ]]; then
+      CGROUP_V2_PATH="${cgroup_dir}"
+      CGROUP_LIMITS_FOUND="true"
+      while [[ "${cgroup_dir}" == "/sys/fs/cgroup" || "${cgroup_dir}" == /sys/fs/cgroup/* ]]; do
+        limit_bytes="$(head -n 1 "${cgroup_dir}/memory.max" 2>/dev/null || true)"
+        current_bytes="$(head -n 1 "${cgroup_dir}/memory.current" 2>/dev/null || true)"
+        if [[ "${limit_bytes}" =~ ^[0-9]+$ ]] && (( limit_bytes < unlimited_threshold )); then
+          [[ "${current_bytes}" =~ ^[0-9]+$ ]] || return 1
+          limit_kib=$((limit_bytes / 1024))
+          if (( limit_kib < EFFECTIVE_MEMORY_TOTAL_KIB )); then
+            EFFECTIVE_MEMORY_TOTAL_KIB="${limit_kib}"
+          fi
+          current_kib=$((current_bytes / 1024))
+          remaining_kib=$((limit_kib > current_kib ? limit_kib - current_kib : 0))
+          if (( remaining_kib < EFFECTIVE_MEMORY_AVAILABLE_KIB )); then
+            EFFECTIVE_MEMORY_AVAILABLE_KIB="${remaining_kib}"
+          fi
+        fi
+
+        limit_bytes="$(head -n 1 "${cgroup_dir}/memory.swap.max" 2>/dev/null || true)"
+        current_bytes="$(head -n 1 "${cgroup_dir}/memory.swap.current" 2>/dev/null || true)"
+        if [[ "${limit_bytes}" =~ ^[0-9]+$ ]] && (( limit_bytes < unlimited_threshold )); then
+          [[ "${current_bytes}" =~ ^[0-9]+$ ]] || return 1
+          limit_kib=$((limit_bytes / 1024))
+          if (( limit_kib < EFFECTIVE_SWAP_TOTAL_KIB )); then
+            EFFECTIVE_SWAP_TOTAL_KIB="${limit_kib}"
+          fi
+          if (( CGROUP_SWAP_LIMIT_KIB < 0 || limit_kib < CGROUP_SWAP_LIMIT_KIB )); then
+            CGROUP_SWAP_LIMIT_KIB="${limit_kib}"
+          fi
+          current_kib=$((current_bytes / 1024))
+          remaining_kib=$((limit_kib > current_kib ? limit_kib - current_kib : 0))
+          if (( remaining_kib < EFFECTIVE_SWAP_FREE_KIB )); then
+            EFFECTIVE_SWAP_FREE_KIB="${remaining_kib}"
+          fi
+          if (( CGROUP_SWAP_REMAINING_KIB < 0 || remaining_kib < CGROUP_SWAP_REMAINING_KIB )); then
+            CGROUP_SWAP_REMAINING_KIB="${remaining_kib}"
+          fi
+        fi
+
+        [[ "${cgroup_dir}" == "/sys/fs/cgroup" ]] && break
+        cgroup_dir="${cgroup_dir%/*}"
+      done
+    fi
+  fi
+
+  EFFECTIVE_HEADROOM_KIB=$((EFFECTIVE_MEMORY_AVAILABLE_KIB + EFFECTIVE_SWAP_FREE_KIB))
+  return 0
+}
+
+build_memory_is_sufficient() {
+  local required_memory_kib=$((MIN_BUILD_MEMORY_MB * 1024))
+  local required_swap_kib=$((MIN_BUILD_SWAP_MB * 1024))
+  local swap_tolerance_kib="${SWAP_ACCOUNTING_TOLERANCE_KIB}"
+  local ram_tolerance_kib=$((RAM_CAPACITY_TOLERANCE_MB * 1024))
+
+  (( EFFECTIVE_HEADROOM_KIB >= required_memory_kib )) || return 1
+  if (( EFFECTIVE_MEMORY_TOTAL_KIB + ram_tolerance_kib < required_memory_kib \
+    && EFFECTIVE_SWAP_TOTAL_KIB + swap_tolerance_kib < required_swap_kib )); then
+    return 1
+  fi
+  return 0
+}
+
+print_build_memory_state() {
+  echo "Build memory: $((EFFECTIVE_MEMORY_AVAILABLE_KIB / 1024)) MB RAM available + $((EFFECTIVE_SWAP_FREE_KIB / 1024)) MB usable swap free = $((EFFECTIVE_HEADROOM_KIB / 1024)) MB (required ${MIN_BUILD_MEMORY_MB} MB)"
+  if (( EFFECTIVE_MEMORY_TOTAL_KIB + RAM_CAPACITY_TOLERANCE_MB * 1024 < MIN_BUILD_MEMORY_MB * 1024 )); then
+    echo "Low-RAM build: $((EFFECTIVE_SWAP_TOTAL_KIB / 1024)) MB usable active swap detected (required ${MIN_BUILD_SWAP_MB} MB)"
+  fi
+}
+
+low_memory_failure() {
+  local reason="$1"
+
+  read_build_memory_state || true
+  echo "ERROR: insufficient memory for compiling the Go components"
+  print_build_memory_state
+  echo "Reason: ${reason}"
+  if [[ "${ALLOW_LOW_MEMORY}" == "true" ]]; then
+    echo "Warning: OLCSERVER_ALLOW_LOW_MEMORY_BUILD=true; attempting the build anyway"
+    return 0
+  fi
+  echo "Installation stopped before compilation. Add RAM or usable swap, then rerun it."
+  echo "Diagnostics: free -h; swapon --show; cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.swap.max 2>/dev/null"
+  echo "Override at your own risk with OLCSERVER_ALLOW_LOW_MEMORY_BUILD=true"
+  return 1
+}
+
+verify_build_memory() {
+  local reason="${1:-the available build memory fell below the required level}"
+
+  if ! read_build_memory_state; then
+    low_memory_failure "could not read /proc/meminfo"
+    return
+  fi
+  if build_memory_is_sufficient; then
+    return 0
+  fi
+  low_memory_failure "${reason}"
+}
+
+prepare_work_dir() {
+  local candidate filesystem_type disk_available_kib
+
+  for candidate in /var/tmp /var/lib; do
+    [[ -d "${candidate}" && -w "${candidate}" ]] || continue
+    filesystem_type="$(findmnt -nro FSTYPE -T "${candidate}" 2>/dev/null || true)"
+    case "${filesystem_type}" in
+      ""|tmpfs|ramfs) continue ;;
+    esac
+    disk_available_kib="$(df -Pk "${candidate}" 2>/dev/null | awk 'NR == 2 { print $4 }' || true)"
+    if [[ ! "${disk_available_kib}" =~ ^[0-9]+$ || "${disk_available_kib}" -lt 1048576 ]]; then
+      continue
+    fi
+    if WORK_DIR="$(mktemp -d "${candidate}/olcserver-install.XXXXXX")"; then
+      if ! install -d -m 0700 "${WORK_DIR}/go-tmp"; then
+        rm -rf -- "${WORK_DIR}"
+        WORK_DIR=""
+        continue
+      fi
+      export GOTMPDIR="${WORK_DIR}/go-tmp"
+      return 0
+    fi
+  done
+
+  echo "ERROR: no disk-backed temporary directory with at least 1024 MB free was found"
+  return 1
+}
+
+ensure_build_swap() {
+  local required_memory_kib=$((MIN_BUILD_MEMORY_MB * 1024))
+  local required_swap_kib=$((MIN_BUILD_SWAP_MB * 1024))
+  local swap_tolerance_kib="${SWAP_ACCOUNTING_TOLERANCE_KIB}"
+  local ram_tolerance_kib=$((RAM_CAPACITY_TOLERANCE_MB * 1024))
+  local margin_kib=$((BUILD_MEMORY_MARGIN_MB * 1024))
+  local missing_headroom_kib missing_swap_kib missing_kib swap_size_mb
+  local cgroup_new_swap_kib cgroup_new_swap_mb
+  local disk_available_kib filesystem_type orphaned_swap temporary_swap_path
+  local container_detected="false" chroot_detected="false"
+
+  orphaned_swap="$(find / -maxdepth 1 -type f \
+    \( -name 'swapfile.olcserver.*' -o -name 'olcserver.swap.olcserver.*' \) \
+    -print -quit 2>/dev/null || true)"
   if [[ -n "${orphaned_swap}" ]]; then
     echo "Warning: found a swap file from an interrupted installer run: ${orphaned_swap}"
     echo "Inspect it before removal with: swapon --show; ls -lh ${orphaned_swap}"
   fi
+
+  if ! read_build_memory_state; then
+    low_memory_failure "could not inspect /proc/meminfo"
+    return
+  fi
   if command -v systemd-detect-virt >/dev/null 2>&1; then
-    if systemd-detect-virt --container --quiet 2>/dev/null || systemd-detect-virt --chroot --quiet 2>/dev/null; then
-      if [[ "${AUTO_SWAP}" == "true" ]]; then
-        echo "Warning: automatic swap is unavailable inside a container or chroot"
-      else
-        echo "Automatic swap is disabled"
-      fi
-      echo "Using ${BUILD_JOBS} Go build job(s); increase the host memory limit if the build is killed"
+    systemd-detect-virt --container --quiet 2>/dev/null && container_detected="true"
+    systemd-detect-virt --chroot --quiet 2>/dev/null && chroot_detected="true"
+  fi
+  print_build_memory_state
+
+  if [[ "${container_detected}" == "true" && "${CGROUP_LIMITS_FOUND}" != "true" ]]; then
+    low_memory_failure "container memory limits could not be read reliably"
+    return
+  fi
+  if build_memory_is_sufficient; then
+    return 0
+  fi
+  if [[ "${AUTO_SWAP}" != "true" ]]; then
+    low_memory_failure "automatic swap creation is disabled"
+    return
+  fi
+  if [[ "${container_detected}" == "true" || "${chroot_detected}" == "true" ]]; then
+    low_memory_failure "swap must be enabled on the host for a container or chroot"
+    return
+  fi
+  if (( CGROUP_SWAP_LIMIT_KIB >= 0 )); then
+    if (( EFFECTIVE_MEMORY_TOTAL_KIB + ram_tolerance_kib < required_memory_kib \
+      && CGROUP_SWAP_LIMIT_KIB + swap_tolerance_kib < required_swap_kib )); then
+      low_memory_failure "the cgroup swap limit is below ${MIN_BUILD_SWAP_MB} MB"
+      return
+    fi
+    if (( CGROUP_SWAP_REMAINING_KIB >= 0 \
+      && EFFECTIVE_MEMORY_AVAILABLE_KIB + CGROUP_SWAP_REMAINING_KIB < required_memory_kib )); then
+      low_memory_failure "the cgroup memory and swap limits cannot provide ${MIN_BUILD_MEMORY_MB} MB"
       return
     fi
   fi
-  if [[ ! -r /proc/meminfo || ! -r /proc/swaps ]]; then
-    echo "Warning: cannot inspect system memory; continuing without automatic swap"
-    return
-  fi
 
-  memory_kib="$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)"
-  swap_kib="$(awk '/^SwapTotal:/ { print $2; exit }' /proc/meminfo)"
-  if [[ ! "${memory_kib}" =~ ^[0-9]+$ || ! "${swap_kib}" =~ ^[0-9]+$ ]]; then
-    echo "Warning: cannot determine system memory; continuing without automatic swap"
-    return
+  SWAP_FILE="${PRIMARY_SWAP_FILE}"
+  if swap_file_is_active "${SWAP_FILE}" || [[ -e "${SWAP_FILE}" || -L "${SWAP_FILE}" ]]; then
+    echo "${SWAP_FILE} already exists and will be left untouched"
+    SWAP_FILE="${SUPPLEMENTAL_SWAP_FILE}"
   fi
-
-  minimum_kib=$((MIN_BUILD_MEMORY_MB * 1024))
-  if (( memory_kib + swap_kib >= minimum_kib )); then
-    return
-  fi
-
-  echo "Detected less than ${MIN_BUILD_MEMORY_MB} MB of RAM and swap"
-  if [[ "${AUTO_SWAP}" != "true" ]]; then
-    echo "Automatic swap is disabled; using ${BUILD_JOBS} Go build job(s)"
-    return
-  fi
-  if swap_file_is_active; then
-    echo "Warning: ${SWAP_FILE} is active but total build memory is still below the target"
-    return
-  fi
-  if [[ -e "${SWAP_FILE}" || -L "${SWAP_FILE}" ]]; then
-    echo "Warning: ${SWAP_FILE} already exists and was left untouched"
-    echo "Using ${BUILD_JOBS} Go build job(s)"
+  if swap_file_is_active "${SWAP_FILE}" || [[ -e "${SWAP_FILE}" || -L "${SWAP_FILE}" ]]; then
+    low_memory_failure "both ${PRIMARY_SWAP_FILE} and ${SUPPLEMENTAL_SWAP_FILE} already exist, but usable memory is still insufficient"
     return
   fi
 
@@ -242,66 +473,90 @@ ensure_build_swap() {
   case "${filesystem_type}" in
     ext2|ext3|ext4|xfs) ;;
     *)
-      echo "Warning: automatic swap is not supported on ${filesystem_type:-this filesystem}"
-      echo "Using ${BUILD_JOBS} Go build job(s)"
+      low_memory_failure "automatic swap is not supported on ${filesystem_type:-this filesystem}"
       return
       ;;
   esac
 
-  missing_kib=$((minimum_kib - memory_kib - swap_kib))
+  missing_headroom_kib=$((required_memory_kib + margin_kib - EFFECTIVE_HEADROOM_KIB))
+  (( missing_headroom_kib > 0 )) || missing_headroom_kib=0
+  missing_swap_kib=0
+  if (( EFFECTIVE_MEMORY_TOTAL_KIB + ram_tolerance_kib < required_memory_kib \
+    && EFFECTIVE_SWAP_TOTAL_KIB + swap_tolerance_kib < required_swap_kib )); then
+    missing_swap_kib=$((required_swap_kib - swap_tolerance_kib - EFFECTIVE_SWAP_TOTAL_KIB))
+  fi
+  missing_kib="${missing_headroom_kib}"
+  (( missing_swap_kib <= missing_kib )) || missing_kib="${missing_swap_kib}"
   swap_size_mb=$(((missing_kib + 1023) / 1024))
   swap_size_mb=$((((swap_size_mb + 1023) / 1024) * 1024))
+  (( swap_size_mb > 0 )) || swap_size_mb=1024
+  if (( CGROUP_SWAP_REMAINING_KIB >= 0 )); then
+    cgroup_new_swap_kib=$((CGROUP_SWAP_REMAINING_KIB - EFFECTIVE_SWAP_FREE_KIB))
+    if (( cgroup_new_swap_kib <= 0 )); then
+      low_memory_failure "the cgroup has no usable swap allowance left"
+      return
+    fi
+    cgroup_new_swap_mb=$(((cgroup_new_swap_kib + 1023) / 1024 + 1))
+    if (( swap_size_mb > cgroup_new_swap_mb )); then
+      swap_size_mb="${cgroup_new_swap_mb}"
+    fi
+  fi
+
   disk_available_kib="$(df -Pk / 2>/dev/null | awk 'NR == 2 { print $4 }' || true)"
   if [[ ! "${disk_available_kib}" =~ ^[0-9]+$ ]]; then
-    echo "Warning: cannot determine free disk space; continuing without automatic swap"
+    low_memory_failure "free disk space could not be determined"
     return
   fi
   if (( disk_available_kib < swap_size_mb * 1024 + 2 * 1024 * 1024 )); then
-    echo "Warning: not enough disk space to create ${swap_size_mb} MB of swap"
-    echo "Using ${BUILD_JOBS} Go build job(s)"
+    low_memory_failure "not enough disk space to create ${swap_size_mb} MB of swap and retain 2048 MB for the build"
     return
   fi
 
   echo "Creating ${swap_size_mb} MB of swap at ${SWAP_FILE}"
-  if ! MANAGED_SWAP_PATH="$(mktemp /swapfile.olcserver.XXXXXX)"; then
-    echo "Warning: could not create a temporary swap file; continuing without automatic swap"
+  if ! MANAGED_SWAP_PATH="$(mktemp "${SWAP_FILE}.olcserver.XXXXXX")"; then
+    low_memory_failure "a temporary swap file could not be created"
     return
   fi
   SWAP_SETUP_PENDING="true"
   if ! chmod 0600 "${MANAGED_SWAP_PATH}"; then
-    echo "Warning: could not secure swap; using ${BUILD_JOBS} Go build job(s)"
     cleanup_pending_swap
+    low_memory_failure "the swap file could not be secured"
     return
   fi
   if ! dd if=/dev/zero of="${MANAGED_SWAP_PATH}" bs=1M count="${swap_size_mb}"; then
-    echo "Warning: could not allocate swap; using ${BUILD_JOBS} Go build job(s)"
     cleanup_pending_swap
+    low_memory_failure "the swap file could not be allocated"
     return
   fi
   if ! mkswap "${MANAGED_SWAP_PATH}" >/dev/null; then
-    echo "Warning: could not format swap; using ${BUILD_JOBS} Go build job(s)"
     cleanup_pending_swap
+    low_memory_failure "the swap file could not be formatted"
     return
   fi
   if ! ln -- "${MANAGED_SWAP_PATH}" "${SWAP_FILE}"; then
-    echo "Warning: ${SWAP_FILE} appeared during setup and was left untouched"
     cleanup_pending_swap
+    low_memory_failure "${SWAP_FILE} appeared during setup and was left untouched"
     return
   fi
-  local temporary_swap_path="${MANAGED_SWAP_PATH}"
+  temporary_swap_path="${MANAGED_SWAP_PATH}"
   MANAGED_SWAP_PATH="${SWAP_FILE}"
   if ! rm -f -- "${temporary_swap_path}"; then
-    echo "Warning: could not finalize the swap file; using ${BUILD_JOBS} Go build job(s)"
     cleanup_pending_swap
     rm -f -- "${temporary_swap_path}" || true
+    low_memory_failure "the swap file could not be finalized"
     return
   fi
   if ! swapon "${SWAP_FILE}"; then
-    echo "Warning: could not enable swap; using ${BUILD_JOBS} Go build job(s)"
     cleanup_pending_swap
+    low_memory_failure "the kernel or VPS provider rejected swapon"
     return
   fi
 
+  if ! read_build_memory_state || ! build_memory_is_sufficient; then
+    low_memory_failure "swap was enabled, but the effective memory target was not reached"
+    return
+  fi
+  print_build_memory_state
   if register_swap_in_fstab; then
     SWAP_SETUP_PENDING="false"
     MANAGED_SWAP_PATH=""
@@ -312,7 +567,29 @@ ensure_build_swap() {
 }
 
 go_build() {
-  GOMAXPROCS="${BUILD_JOBS}" /usr/local/go/bin/go build -p "${BUILD_JOBS}" "$@"
+  local build_status
+
+  if CGO_ENABLED=0 GOMAXPROCS="${BUILD_JOBS}" GOGC="${BUILD_GOGC}" \
+    /usr/local/go/bin/go build -p "${BUILD_JOBS}" "$@"; then
+    return 0
+  else
+    build_status=$?
+  fi
+
+  echo "Go build failed (exit ${build_status}). Current memory diagnostics:"
+  if read_build_memory_state; then
+    print_build_memory_state
+  fi
+  if [[ -n "${CGROUP_V2_PATH}" && -r "${CGROUP_V2_PATH}/memory.events" ]]; then
+    echo "Cgroup memory events:"
+    awk '/^(oom|oom_kill|oom_group_kill) / { print }' "${CGROUP_V2_PATH}/memory.events" || true
+  fi
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl -k -b --no-pager 2>/dev/null \
+      | grep -Ei 'out of memory|oom-kill|killed process' \
+      | tail -n 20 || true
+  fi
+  return "${build_status}"
 }
 
 trap cleanup EXIT
@@ -328,24 +605,53 @@ if ! flock -n 9; then
   echo "Another Olc Server installation is already running"
   exit 1
 fi
-ensure_build_swap
+if ! ensure_build_swap; then
+  exit 1
+fi
 
 PORTS_BUSY="false"
-if ss -ltn 2>/dev/null | grep -Eq ':[[:digit:]]+ (LISTEN|[0-9]+)' ; then
-  if ss -ltn 2>/dev/null | grep -Eq '(^|:)80[[:space:]]|(^|:)443[[:space:]]'; then
-    PORTS_BUSY="true"
+LISTENING_SOCKETS="$(ss -ltnp 2>/dev/null || true)"
+if grep -Eq '(^|:)80[[:space:]]|(^|:)443[[:space:]]' <<<"${LISTENING_SOCKETS}"; then
+  PORTS_BUSY="true"
+fi
+
+if [[ -f /etc/nginx/sites-available/olcserver ]]; then
+  EXISTING_CERT_NAME="$(awk '
+    $1 == "server_name" {
+      gsub(/;/, "", $2)
+      print $2
+      exit
+    }
+  ' /etc/nginx/sites-available/olcserver 2>/dev/null || true)"
+  if systemctl is-active --quiet nginx 2>/dev/null \
+    && awk '
+      /:(80|443)[[:space:]]/ {
+        found = 1
+        if ($0 !~ /nginx/) external = 1
+      }
+      END { exit(found && !external ? 0 : 1) }
+    ' <<<"${LISTENING_SOCKETS}"; then
+    MANAGED_PROXY_ACTIVE="true"
   fi
 fi
 
-if [[ "${PORTS_BUSY}" == "false" ]]; then
-  "${PKG_INSTALL[@]}" "${WEB_PACKAGES[@]}"
+if [[ "${PORTS_BUSY}" == "false" || "${MANAGED_PROXY_ACTIVE}" == "true" ]]; then
   LISTEN_ADDRESS="127.0.0.1"
   HTTPS_ENABLED="true"
-elif [[ -n "${DOMAIN}" ]]; then
+  if [[ "${MANAGED_PROXY_ACTIVE}" == "true" ]]; then
+    echo "Existing Olc Server nginx proxy detected; it will be updated"
+  fi
+else
   echo "Ports 80/443 are already in use; leaving existing proxy untouched and using HTTP on :${PANEL_PORT}"
+  if systemctl is-active --quiet nginx 2>/dev/null \
+    && [[ ! -e /etc/nginx/sites-enabled/olcserver ]]; then
+    echo "If nginx was left by an earlier failed installation and has no other sites, stop it and rerun to configure HTTPS"
+  fi
 fi
 
-WORK_DIR="$(mktemp -d /tmp/olcserver-install.XXXXXX)"
+if ! prepare_work_dir; then
+  exit 1
+fi
 
 echo "[1/6] Installing Go ${GO_VERSION}"
 curl --fail --location --retry 3 "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o "${WORK_DIR}/go.tar.gz"
@@ -354,6 +660,9 @@ tar -C /usr/local -xzf "${WORK_DIR}/go.tar.gz"
 
 echo "[2/6] Building olcrtc"
 git clone --depth 1 --recurse-submodules --shallow-submodules --branch "${OLCRTC_REF}" "${OLCRTC_REPOSITORY}" "${WORK_DIR}/olcrtc"
+if ! verify_build_memory "available memory dropped below the build requirement before compiling olcrtc"; then
+  exit 1
+fi
 (
   cd "${WORK_DIR}/olcrtc"
   go_build -trimpath -ldflags="-s -w" -o "${WORK_DIR}/olcrtc-bin" ./cmd/olcrtc
@@ -365,12 +674,18 @@ if [[ -f "$(dirname "$0")/go.mod" ]]; then
 else
   git clone --depth 1 --branch "${OLCSERVER_REF}" "${OLCSERVER_REPOSITORY}" "${WORK_DIR}/olcserver"
 fi
+if ! verify_build_memory "available memory dropped below the build requirement before compiling Olc Server"; then
+  exit 1
+fi
 (
   cd "${WORK_DIR}/olcserver"
   go_build -trimpath -ldflags="-s -w" -o "${WORK_DIR}/olcserver-bin" .
 )
 
 echo "[4/6] Installing services"
+if [[ "${HTTPS_ENABLED}" == "true" ]]; then
+  "${PKG_INSTALL[@]}" "${WEB_PACKAGES[@]}"
+fi
 if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
   useradd --system --home-dir "${DATA_ROOT}" --shell /usr/sbin/nologin "${SERVICE_USER}"
 fi
@@ -410,15 +725,16 @@ EOF
 
 echo "[5/6] Starting Olc Server"
 systemctl daemon-reload
-systemctl enable --now olcserver.service
+systemctl enable olcserver.service
+systemctl restart olcserver.service
 sleep 2
 systemctl is-active --quiet olcserver.service
 
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 SERVER_IP="${SERVER_IP:-YOUR_SERVER_IP}"
 
-if [[ "${PORTS_BUSY}" == "false" ]]; then
-  CERT_NAME="${DOMAIN:-${SERVER_IP}}"
+if [[ "${HTTPS_ENABLED}" == "true" ]]; then
+  CERT_NAME="${DOMAIN:-${EXISTING_CERT_NAME:-${SERVER_IP}}}"
 fi
 
 if [[ "${HTTPS_ENABLED}" == "true" ]]; then
