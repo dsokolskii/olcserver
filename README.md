@@ -8,6 +8,26 @@ Olc Server is a web control panel for managing `olcrtc` rooms on Linux.
 curl -fsSL https://raw.githubusercontent.com/dsokolskii/olcserver/master/install.sh | sudo bash
 ```
 
+The installer keeps the application bound to `127.0.0.1:8080` and configures
+nginx as the public reverse proxy. Requests to port 80 are redirected to HTTPS
+on port 443. Ports 80 and 443 must be reachable from the Internet for
+certificate issuance and renewal. If either port belongs to a service other
+than nginx, installation stops instead of exposing the admin panel over plain
+HTTP.
+
+Without additional settings, the installer requests a short-lived Let's
+Encrypt certificate for the server IP address. Certbot renews it twice daily.
+To use a DNS name instead, point its A or AAAA record at the server and run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dsokolskii/olcserver/master/install.sh \
+  | sudo OLCSERVER_DOMAIN=panel.example.com \
+    LETSENCRYPT_EMAIL=admin@example.com bash
+```
+
+The packaged nginx welcome site is removed automatically. Existing custom
+nginx sites are left in place.
+
 ### Low-memory servers
 
 The installer checks available RAM and free swap, including cgroup v2 limits when available, before compilation. A host with substantially less than 4 GiB of usable RAM must have at least 4 GiB of active swap, as recommended by the [`olcrtc` manual](https://github.com/openlibrecommunity/olcrtc/blob/master/docs/manual.md); a 256 MiB tolerance prevents nominal 4 GiB VPSes from being mistaken for smaller plans because of kernel-reserved memory. On supported hosts the installer attempts to create the missing swap at `/swapfile`; if that path already exists, it uses `/olcserver.swap` without modifying the existing file. Successfully registered swap remains enabled after installation and continues to occupy disk space.

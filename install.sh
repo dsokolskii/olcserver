@@ -12,6 +12,7 @@ SERVICE_USER="olcserver"
 PANEL_PORT="${OLCSERVER_PORT:-8080}"
 DOMAIN="${OLCSERVER_DOMAIN:-}"
 LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
+CERTBOT_VERSION="${OLCSERVER_CERTBOT_VERSION:-5.4.0}"
 AUTO_SWAP="${OLCSERVER_AUTO_SWAP:-true}"
 MIN_BUILD_MEMORY_MB="${OLCSERVER_MIN_BUILD_MEMORY_MB:-4096}"
 MIN_BUILD_SWAP_MB="${OLCSERVER_MIN_BUILD_SWAP_MB:-4096}"
@@ -25,9 +26,12 @@ PRIMARY_SWAP_FILE="/swapfile"
 SUPPLEMENTAL_SWAP_FILE="/olcserver.swap"
 SWAP_FILE="${PRIMARY_SWAP_FILE}"
 INSTALL_LOCK_FILE="/run/olcserver-install.lock"
-LISTEN_ADDRESS="0.0.0.0"
-HTTPS_ENABLED="false"
-MANAGED_PROXY_ACTIVE="false"
+LISTEN_ADDRESS="127.0.0.1"
+CERTBOT_ROOT="${INSTALL_ROOT}/certbot"
+CERTBOT_BIN="${CERTBOT_ROOT}/bin/certbot"
+ACME_WEBROOT="/var/www/olcserver-acme"
+NGINX_SITE_PATH="/etc/nginx/conf.d/olcserver.conf"
+REMOVE_DEFAULT_NGINX_SITE="false"
 EXISTING_CERT_NAME=""
 MANAGED_SWAP_PATH=""
 SWAP_SETUP_PENDING="false"
@@ -61,6 +65,7 @@ if ! command -v systemctl >/dev/null 2>&1; then
   echo "This installer requires a Linux distribution with systemd"
   exit 1
 fi
+SYSTEMCTL_BIN="$(command -v systemctl)"
 
 case "${AUTO_SWAP}" in
   true|false) ;;
@@ -86,6 +91,10 @@ if [[ ! "${BUILD_GOGC}" =~ ^[1-9][0-9]*$ ]] || (( BUILD_GOGC > 100 )); then
   echo "OLCSERVER_BUILD_GOGC must be an integer between 1 and 100"
   exit 1
 fi
+if [[ ! "${CERTBOT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "OLCSERVER_CERTBOT_VERSION must be a semantic version such as 5.4.0"
+  exit 1
+fi
 if (( MIN_BUILD_MEMORY_MB == 4096 )); then
   RAM_CAPACITY_TOLERANCE_MB=256
 fi
@@ -97,22 +106,22 @@ if command -v apt-get >/dev/null 2>&1; then
   PKG_UPDATE=(apt-get update)
   PKG_INSTALL=(apt-get install -y --no-install-recommends)
   BASE_PACKAGES=(ca-certificates curl git tar iproute2 util-linux)
-  WEB_PACKAGES=(nginx certbot python3-certbot-nginx)
+  WEB_PACKAGES=(nginx python3 python3-dev python3-venv gcc)
 elif command -v dnf >/dev/null 2>&1; then
   PKG_UPDATE=(dnf makecache)
   PKG_INSTALL=(dnf install -y)
   BASE_PACKAGES=(ca-certificates curl git tar iproute util-linux)
-  WEB_PACKAGES=(nginx certbot python3-certbot-nginx)
+  WEB_PACKAGES=(nginx python3 python3-devel gcc)
 elif command -v yum >/dev/null 2>&1; then
   PKG_UPDATE=(yum makecache)
   PKG_INSTALL=(yum install -y)
   BASE_PACKAGES=(ca-certificates curl git tar iproute util-linux)
-  WEB_PACKAGES=(nginx certbot python3-certbot-nginx)
+  WEB_PACKAGES=(nginx python3 python3-devel gcc)
 elif command -v pacman >/dev/null 2>&1; then
   PKG_UPDATE=(pacman -Sy --noconfirm)
   PKG_INSTALL=(pacman -S --noconfirm --needed)
   BASE_PACKAGES=(ca-certificates curl git tar iproute2 util-linux)
-  WEB_PACKAGES=(nginx certbot certbot-nginx)
+  WEB_PACKAGES=(nginx python python-pip gcc)
 else
   echo "Unsupported Linux distribution: no supported package manager found"
   exit 1
@@ -608,6 +617,112 @@ go_build() {
   return "${build_status}"
 }
 
+web_ports_are_owned_by_nginx() {
+  awk '
+    /:(80|443)[[:space:]]/ {
+      found = 1
+      if ($0 !~ /nginx/) external = 1
+    }
+    END { exit(found && !external ? 0 : 1) }
+  ' <<<"${LISTENING_SOCKETS}"
+}
+
+nginx_packaged_default_site_is_enabled() {
+  local default_site="/etc/nginx/sites-enabled/default"
+
+  [[ -e "${default_site}" ]] || return 1
+  grep -Eq '^[[:space:]]*listen[[:space:]]+80[[:space:]]+default_server;' \
+    "${default_site}" || return 1
+  grep -Eq '^[[:space:]]*root[[:space:]]+/var/www/html;' \
+    "${default_site}" || return 1
+  grep -Eq '^[[:space:]]*server_name[[:space:]]+_;' \
+    "${default_site}" || return 1
+  ! grep -Eq '^[[:space:]]*proxy_pass[[:space:]]' "${default_site}"
+}
+
+write_http_challenge_proxy() {
+  cat >"${NGINX_SITE_PATH}" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${CERT_NAME};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${ACME_WEBROOT};
+        default_type text/plain;
+    }
+
+    location / {
+        return 503;
+    }
+}
+EOF
+}
+
+write_https_proxy() {
+  cat >"${NGINX_SITE_PATH}" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${CERT_NAME};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${ACME_WEBROOT};
+        default_type text/plain;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name ${CERT_NAME};
+
+    ssl_certificate /etc/letsencrypt/live/${CERT_NAME}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${CERT_NAME}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://127.0.0.1:${PANEL_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+EOF
+}
+
+install_certificate_renewal_timer() {
+  cat >/etc/systemd/system/olcserver-certbot-renew.service <<EOF
+[Unit]
+Description=Renew the Olc Server TLS certificate
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${CERTBOT_BIN} renew --quiet --deploy-hook "${SYSTEMCTL_BIN} reload nginx"
+EOF
+
+  cat >/etc/systemd/system/olcserver-certbot-renew.timer <<EOF
+[Unit]
+Description=Renew the Olc Server TLS certificate twice daily
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 trap cleanup EXIT
 
 export DEBIAN_FRONTEND=noninteractive
@@ -631,7 +746,15 @@ if grep -Eq '(^|:)80[[:space:]]|(^|:)443[[:space:]]' <<<"${LISTENING_SOCKETS}"; 
   PORTS_BUSY="true"
 fi
 
-if [[ -f /etc/nginx/sites-available/olcserver ]]; then
+if [[ -f "${NGINX_SITE_PATH}" ]]; then
+  EXISTING_CERT_NAME="$(awk '
+    $1 == "server_name" {
+      gsub(/;/, "", $2)
+      print $2
+      exit
+    }
+  ' "${NGINX_SITE_PATH}" 2>/dev/null || true)"
+elif [[ -f /etc/nginx/sites-available/olcserver ]]; then
   EXISTING_CERT_NAME="$(awk '
     $1 == "server_name" {
       gsub(/;/, "", $2)
@@ -639,30 +762,36 @@ if [[ -f /etc/nginx/sites-available/olcserver ]]; then
       exit
     }
   ' /etc/nginx/sites-available/olcserver 2>/dev/null || true)"
-  if systemctl is-active --quiet nginx 2>/dev/null \
-    && awk '
-      /:(80|443)[[:space:]]/ {
-        found = 1
-        if ($0 !~ /nginx/) external = 1
-      }
-      END { exit(found && !external ? 0 : 1) }
-    ' <<<"${LISTENING_SOCKETS}"; then
-    MANAGED_PROXY_ACTIVE="true"
+fi
+
+if [[ "${PORTS_BUSY}" == "true" ]]; then
+  if systemctl is-active --quiet nginx 2>/dev/null && web_ports_are_owned_by_nginx; then
+    echo "Existing nginx listener detected; Olc Server will be added as an HTTPS reverse proxy"
+    if nginx_packaged_default_site_is_enabled; then
+      REMOVE_DEFAULT_NGINX_SITE="true"
+      echo "The packaged nginx welcome site will be removed"
+    fi
+  else
+    echo "ERROR: port 80 or 443 is occupied by a service other than nginx"
+    echo "Olc Server will not expose the admin panel over plain HTTP on :${PANEL_PORT}"
+    awk '/:(80|443)[[:space:]]/' <<<"${LISTENING_SOCKETS}"
+    exit 1
   fi
 fi
 
-if [[ "${PORTS_BUSY}" == "false" || "${MANAGED_PROXY_ACTIVE}" == "true" ]]; then
-  LISTEN_ADDRESS="127.0.0.1"
-  HTTPS_ENABLED="true"
-  if [[ "${MANAGED_PROXY_ACTIVE}" == "true" ]]; then
-    echo "Existing Olc Server nginx proxy detected; it will be updated"
-  fi
-else
-  echo "Ports 80/443 are already in use; leaving existing proxy untouched and using HTTP on :${PANEL_PORT}"
-  if systemctl is-active --quiet nginx 2>/dev/null \
-    && [[ ! -e /etc/nginx/sites-enabled/olcserver ]]; then
-    echo "If nginx was left by an earlier failed installation and has no other sites, stop it and rerun to configure HTTPS"
-  fi
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+if [[ -z "${SERVER_IP}" ]]; then
+  echo "ERROR: could not determine the server IP address"
+  exit 1
+fi
+CERT_NAME="${DOMAIN:-${EXISTING_CERT_NAME:-${SERVER_IP}}}"
+if [[ ! "${CERT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9.:-]*[A-Za-z0-9]$ ]]; then
+  echo "ERROR: invalid certificate name: ${CERT_NAME}"
+  exit 1
+fi
+CERT_IS_IP="false"
+if [[ "${CERT_NAME}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "${CERT_NAME}" == *:* ]]; then
+  CERT_IS_IP="true"
 fi
 
 if ! prepare_work_dir; then
@@ -699,16 +828,23 @@ fi
 )
 
 echo "[4/6] Installing services"
-if [[ "${HTTPS_ENABLED}" == "true" ]]; then
-  "${PKG_INSTALL[@]}" "${WEB_PACKAGES[@]}"
-fi
+"${PKG_INSTALL[@]}" "${WEB_PACKAGES[@]}"
 if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
   useradd --system --home-dir "${DATA_ROOT}" --shell /usr/sbin/nologin "${SERVICE_USER}"
 fi
 install -d -m 0755 "${INSTALL_ROOT}"
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0700 "${DATA_ROOT}"
+install -d -m 0755 "${ACME_WEBROOT}/.well-known/acme-challenge"
 install -m 0755 "${WORK_DIR}/olcrtc-bin" /usr/local/bin/olcrtc
 install -m 0755 "${WORK_DIR}/olcserver-bin" /usr/local/bin/olcserver
+if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
+  echo "ERROR: Certbot ${CERTBOT_VERSION} requires Python 3.10 or newer"
+  exit 1
+fi
+python3 -m venv "${CERTBOT_ROOT}"
+"${CERTBOT_ROOT}/bin/pip" install --disable-pip-version-check --upgrade pip
+"${CERTBOT_ROOT}/bin/pip" install --disable-pip-version-check --upgrade \
+  "certbot==${CERTBOT_VERSION}"
 
 PASSWORD="$(runuser -u "${SERVICE_USER}" -- /usr/local/bin/olcserver init --data "${DATA_ROOT}" 2>/dev/null || true)"
 if [[ -z "${PASSWORD}" ]]; then
@@ -746,43 +882,50 @@ systemctl restart olcserver.service
 sleep 2
 systemctl is-active --quiet olcserver.service
 
-SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-SERVER_IP="${SERVER_IP:-YOUR_SERVER_IP}"
-
-if [[ "${HTTPS_ENABLED}" == "true" ]]; then
-  CERT_NAME="${DOMAIN:-${EXISTING_CERT_NAME:-${SERVER_IP}}}"
+install -d -m 0755 /etc/nginx/conf.d
+if nginx_packaged_default_site_is_enabled; then
+  REMOVE_DEFAULT_NGINX_SITE="true"
 fi
-
-if [[ "${HTTPS_ENABLED}" == "true" ]]; then
-  cat >/etc/nginx/sites-available/olcserver <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${CERT_NAME};
-
-    location / {
-        proxy_pass http://127.0.0.1:${PANEL_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-EOF
-  ln -sfn /etc/nginx/sites-available/olcserver /etc/nginx/sites-enabled/olcserver
+if [[ "${REMOVE_DEFAULT_NGINX_SITE}" == "true" ]]; then
   rm -f /etc/nginx/sites-enabled/default
-  nginx -t
-  systemctl enable --now nginx
-  systemctl reload nginx
-  CERTBOT_EMAIL_ARGS=(--register-unsafely-without-email)
-  if [[ -n "${LETSENCRYPT_EMAIL}" ]]; then
-    CERTBOT_EMAIL_ARGS=(--email "${LETSENCRYPT_EMAIL}")
-  fi
-  certbot --nginx --non-interactive --agree-tos "${CERTBOT_EMAIL_ARGS[@]}" --redirect -d "${CERT_NAME}"
-  PANEL_URL="https://${CERT_NAME}"
+fi
+rm -f /etc/nginx/sites-enabled/olcserver /etc/nginx/sites-available/olcserver
+write_http_challenge_proxy
+nginx -t
+systemctl enable --now nginx
+systemctl reload nginx
+
+CERTBOT_EMAIL_ARGS=(--register-unsafely-without-email)
+if [[ -n "${LETSENCRYPT_EMAIL}" ]]; then
+  CERTBOT_EMAIL_ARGS=(--email "${LETSENCRYPT_EMAIL}")
+fi
+CERTBOT_NAME_ARGS=(-d "${CERT_NAME}")
+CERTBOT_PROFILE_ARGS=()
+if [[ "${CERT_IS_IP}" == "true" ]]; then
+  CERTBOT_NAME_ARGS=(--ip-address "${CERT_NAME}")
+  CERTBOT_PROFILE_ARGS=(--preferred-profile shortlived)
+fi
+"${CERTBOT_BIN}" certonly \
+  --webroot \
+  --webroot-path "${ACME_WEBROOT}" \
+  --cert-name "${CERT_NAME}" \
+  --non-interactive \
+  --agree-tos \
+  "${CERTBOT_EMAIL_ARGS[@]}" \
+  "${CERTBOT_PROFILE_ARGS[@]}" \
+  "${CERTBOT_NAME_ARGS[@]}"
+
+write_https_proxy
+nginx -t
+systemctl reload nginx
+install_certificate_renewal_timer
+systemctl daemon-reload
+systemctl enable --now olcserver-certbot-renew.timer
+
+if [[ "${CERT_NAME}" == *:* ]]; then
+  PANEL_URL="https://[${CERT_NAME}]"
 else
-  PANEL_URL="http://${SERVER_IP}:${PANEL_PORT}"
+  PANEL_URL="https://${CERT_NAME}"
 fi
 
 echo "[6/6] Installation complete"
@@ -800,8 +943,7 @@ echo
 echo "  ${PASSWORD}"
 echo
 echo "The password is also stored at ${DATA_ROOT}/admin-password"
-if [[ "${HTTPS_ENABLED}" == "true" ]]; then
-  echo "HTTPS certificate renewals are handled by certbot's systemd timer"
-fi
+echo "HTTP on port 80 redirects to HTTPS on port 443"
+echo "HTTPS certificate renewals are handled by olcserver-certbot-renew.timer"
 echo "Service logs: journalctl -u olcserver -f"
 echo "============================================================"
